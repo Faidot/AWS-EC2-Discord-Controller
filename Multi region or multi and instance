@@ -1,0 +1,767 @@
+# 🤖 AWS EC2 Discord Controller — Multi-Instance + Multi-Region Edition
+
+Control **multiple AWS EC2 instances across multiple regions** from a single Discord bot using slash commands, with automatic start/stop scheduling via EventBridge Scheduler. One Lambda, one bot, unlimited instances, any region — each addressable by a friendly name.
+
+```
+/start-ec2  name:gameserver     ← ap-south-1
+/stop-ec2   name:devbox         ← us-east-1
+/status-ec2 name:all            ← entire fleet, every region
+```
+
+---
+
+## 📋 Table of Contents
+
+- [Architecture](#architecture)
+- [Features](#features)
+- [Prerequisites](#prerequisites)
+- [Part 1 — Plan Your Instance Map](#part-1--plan-your-instance-map)
+- [Part 2 — Discord Bot Setup](#part-2--discord-bot-setup)
+- [Part 3 — AWS Lambda Function](#part-3--aws-lambda-function)
+- [Part 4 — IAM (Least Privilege, Multi-Region)](#part-4--iam-least-privilege-multi-region)
+- [Part 5 — API Gateway](#part-5--api-gateway)
+- [Part 6 — EventBridge Scheduler (Lambda Target)](#part-6--eventbridge-scheduler-lambda-target)
+- [Part 7 — Register Slash Commands](#part-7--register-slash-commands)
+- [Part 8 — Connect Discord to API Gateway](#part-8--connect-discord-to-api-gateway)
+- [Commands Reference](#commands-reference)
+- [Adding / Removing Instances or Regions Later](#adding--removing-instances-or-regions-later)
+- [Cost Estimate](#cost-estimate)
+- [Troubleshooting](#troubleshooting)
+- [Tech Stack](#tech-stack)
+
+---
+
+## Architecture
+
+```
+Discord Slash Command  (/start-ec2 name:gameserver)
+        │
+        ▼
+  API Gateway (HTTPS POST /discord)
+        │
+        ▼
+  Lambda (Python 3.12) — SINGLE function, TWO entry paths
+        │
+        ├── Path 1: Discord interaction
+        │     1. Verify Ed25519 signature
+        │     2. Check user authorization
+        │     3. Resolve friendly name → {instance ID, region}
+        │     4. Group targets BY REGION → one API call per region
+        │
+        └── Path 2: EventBridge Scheduler payload
+              {"source":"scheduler","action":"start","names":[...]}
+        │
+        ▼
+  EC2 Start / Stop / Reboot / Status — ap-south-1, us-east-1, eu-west-1, ...
+
+EventBridge Scheduler
+  → targets the SAME Lambda with a JSON payload
+  → region logic lives in code, NOT in schedules
+  → add a new region with ZERO schedule changes
+```
+
+### Why Lambda-as-scheduler-target (and not direct EC2 API target)?
+
+EventBridge Scheduler's universal target (`EC2 → StartInstances`) only calls the API **in the same region where the schedule lives**. A schedule in `ap-south-1` **cannot** start an instance in `us-east-1`. You'd need N regions × 2 schedules, all maintained by hand — bleed-prone.
+
+Instead, schedules invoke **your Lambda** with a small payload. The Lambda already knows every instance's region from `INSTANCE_MAP`. New region? Update one env var. Done.
+
+### Key design decisions
+
+| Decision | Why |
+| --- | --- |
+| Friendly names (`gameserver`) not IDs | Discord dropdown, zero typos, region-agnostic UX |
+| `INSTANCE_MAP` = `name → {id, region}` | Single source of truth; no region hardcoded in code |
+| Per-region boto3 client **cache** | One client per region per warm container — fast, no re-init |
+| Region-wise **grouping** for actions | One API call per region (not per instance) — stays under Discord's 3s limit |
+| Scheduler → Lambda payload | Multi-region schedules without multi-region schedule sprawl |
+
+---
+
+## Features
+
+| Feature | Details |
+| --- | --- |
+| 🖥️ Multi-Instance | Control any number of instances from one bot |
+| 🌏 Multi-Region | Instances can live in **any** AWS region, mixed freely |
+| 🏷️ Friendly Names | `gameserver` instead of `i-0abc123...` |
+| 🌐 `all` Target | Start/stop/reboot/status **every** instance, every region |
+| ⏰ Unified Scheduling | One schedule handles instances across all regions |
+| 📊 Status Report | State, IPs, uptime, AZ — per-instance detail + fleet summary |
+| 💰 Cost Tracking | Hourly/daily/monthly estimate + live session cost |
+| 🔒 Authorization | Only whitelisted Discord User IDs can control |
+| 🔐 Least-Privilege IAM | Start/Stop/Reboot locked to your exact instance ARNs (per region) |
+| 🛡️ Fool-Proof | Unknown names rejected with the list of valid names |
+| 🩹 Bleed-Proof | Per-region error isolation — one region failing doesn't block others |
+| 📏 Discord-Safe | Output auto-truncates below the 2000-char message limit |
+| 📜 Audit Trail | Scheduler actions logged to CloudWatch |
+
+---
+
+## Prerequisites
+
+- AWS account with EC2 instances (any regions)
+- Discord account + a server you admin
+- Python 3.x on your PC (only for one-time command registration)
+- AWS CloudShell access
+
+---
+
+## Part 1 — Plan Your Instance Map
+
+Before touching AWS, decide your friendly names. Rules:
+
+- lowercase, no spaces (they become Discord dropdown choices)
+- `all` is **reserved** — never use it as an instance name
+- max **24 instances** if you want dropdown choices (Discord's limit is 25 choices; `all` takes one slot)
+
+This JSON goes into a Lambda env var later — **each instance carries its own region**:
+
+```json
+{
+  "gameserver": {"id": "i-0aaa1111111111111", "region": "ap-south-1"},
+  "devbox":     {"id": "i-0bbb2222222222222", "region": "us-east-1"},
+  "gitlab":     {"id": "i-0ccc3333333333333", "region": "eu-west-1"}
+}
+```
+
+Also decide **schedule groups** (region doesn't matter here — that's the whole point):
+
+| Group | Instances | Schedule |
+| --- | --- | --- |
+| `weekday-9to9` | gameserver, devbox | Mon–Fri 9AM–9PM |
+| `always-on` | gitlab | never auto-stopped |
+
+---
+
+## Part 2 — Discord Bot Setup
+
+### Create Discord Application
+
+1. Go to [discord.com/developers/applications](https://discord.com/developers/applications)
+2. **New Application** → Name: `EC2 Controller`
+3. **General Information** → copy & save:
+   - `Application ID`
+   - `Public Key`
+4. **Bot → Reset Token** → copy `Bot Token` (shown **once** — save it securely)
+
+### Add Bot to Your Server
+
+1. **OAuth2 → URL Generator**
+2. Scopes: `applications.commands` + `bot`
+3. Bot Permissions: `Send Messages`
+4. Open the generated URL → select server → **Authorize**
+
+### Get Your Discord User ID
+
+1. Discord → **Settings → Advanced → Developer Mode ON**
+2. Right-click your username → **Copy User ID**
+
+### Get Your Server ID
+
+Right-click server name → **Copy Server ID**
+
+---
+
+## Part 3 — AWS Lambda Function
+
+The Lambda can live in **any single region** (pick the one closest to you, e.g. `ap-south-1`). It controls instances in **all** regions via boto3 — the function's own region is irrelevant to what it can manage.
+
+### Create Function
+
+1. **Lambda → Create Function**
+2. **Name:** `discord-ec2-controller` · **Runtime:** Python 3.12 · **Arch:** x86_64
+
+### Build Deployment Package (AWS CloudShell)
+
+```bash
+mkdir discord-bot && cd discord-bot
+
+pip install pynacl \
+  --platform manylinux2014_x86_64 \
+  --implementation cp --python-version 312 \
+  --only-binary=:all: -t .
+
+pip install cffi \
+  --platform manylinux2014_x86_64 \
+  --implementation cp --python-version 312 \
+  --only-binary=:all: -t .
+```
+
+Now create the function file:
+
+```bash
+cat > lambda_function.py << 'EOF'
+import json
+import boto3
+import os
+import nacl.signing
+from nacl.exceptions import BadSignatureError
+from datetime import datetime, timezone
+from collections import defaultdict
+
+# ── Configuration ──────────────────────────────────────────────
+DISCORD_PUBLIC_KEY = os.environ['DISCORD_PUBLIC_KEY']
+ALLOWED_USER_IDS   = [u.strip() for u in os.environ['ALLOWED_USER_IDS'].split(',') if u.strip()]
+
+# {"gameserver": {"id": "i-0aaa...", "region": "ap-south-1"}, ...}
+INSTANCE_MAP = json.loads(os.environ['INSTANCE_MAP'])
+ID_TO_NAME   = {v['id']: k for k, v in INSTANCE_MAP.items()}
+
+DISCORD_MSG_LIMIT = 2000
+
+# ── Per-region client cache (created once per warm container) ──
+_clients = {}
+def ec2_client(region):
+    if region not in _clients:
+        _clients[region] = boto3.client('ec2', region_name=region)
+    return _clients[region]
+
+# On-demand USD/hr (approximate; varies slightly by region)
+INSTANCE_COSTS = {
+    't2.micro':   0.0116, 't2.small':  0.023,  't2.medium': 0.0464,
+    't2.large':   0.0928, 't3.micro':  0.0104, 't3.small':  0.0208,
+    't3.medium':  0.0416, 't3.large':  0.0832, 't3.xlarge': 0.1664,
+    't3a.micro':  0.0094, 't3a.small': 0.0188, 't3a.medium':0.0376,
+    'm5.large':   0.096,  'm5.xlarge': 0.192,  'c5.large':  0.085,
+    'c5.xlarge':  0.17,   'r5.large':  0.126,  'r5.xlarge': 0.252,
+}
+STATE_EMOJI = {'running':'🟢','stopped':'🔴','stopping':'🟡','pending':'🟡',
+               'shutting-down':'🟠','terminated':'⚫'}
+
+# ── Security ───────────────────────────────────────────────────
+def verify_signature(event):
+    try:
+        body      = event['body']
+        headers   = {k.lower(): v for k, v in event.get('headers', {}).items()}
+        timestamp = headers.get('x-signature-timestamp', '')
+        signature = headers.get('x-signature-ed25519', '')
+        verify_key = nacl.signing.VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
+        verify_key.verify(f"{timestamp}{body}".encode(), bytes.fromhex(signature))
+        return True
+    except Exception:
+        return False
+
+# ── Instance resolution (fool-proof) ───────────────────────────
+def resolve_names(name):
+    """name string -> (list of instance names, error). Exactly one is None."""
+    valid = ", ".join(f"`{n}`" for n in list(INSTANCE_MAP) + ['all'])
+    name = (name or '').lower().strip()
+    if not name:
+        return None, f"❌ No instance specified. Valid: {valid}"
+    if name == 'all':
+        return list(INSTANCE_MAP), None
+    if name not in INSTANCE_MAP:
+        return None, f"❌ Unknown instance `{name}`. Valid: {valid}"
+    return [name], None
+
+def group_by_region(names):
+    """['gameserver','devbox'] -> {'ap-south-1': ['i-0aaa'], 'us-east-1': ['i-0bbb']}"""
+    groups = defaultdict(list)
+    for n in names:
+        info = INSTANCE_MAP[n]
+        groups[info['region']].append(info['id'])
+    return groups
+
+def pretty(names):
+    return ", ".join(f"**{n}**" for n in names)
+
+# ── Actions (one API call per region — fast, bleed-proof) ──────
+def do_action(action, names):
+    results = []
+    for region, ids in group_by_region(names).items():
+        try:
+            client = ec2_client(region)
+            if action == 'start':
+                client.start_instances(InstanceIds=ids)
+            elif action == 'stop':
+                client.stop_instances(InstanceIds=ids)
+            elif action == 'reboot':
+                client.reboot_instances(InstanceIds=ids)
+            results.append(f"✅ {region}: {len(ids)} instance(s) — {action} OK")
+        except Exception as e:
+            # One region failing must NOT block the others
+            results.append(f"⚠️ {region}: FAILED (`{type(e).__name__}`)")
+    verb = {'start':'Starting','stop':'Stopping','reboot':'Rebooting'}[action]
+    return f"{verb} {pretty(names)}\n" + "\n".join(results)
+
+# ── Status ─────────────────────────────────────────────────────
+def build_report(instance, region, compact=False):
+    iid   = instance['InstanceId']
+    name  = ID_TO_NAME.get(iid, 'unknown')
+    state = instance['State']['Name']
+    itype = instance.get('InstanceType', 'N/A')
+    pub   = instance.get('PublicIpAddress', '—')
+    priv  = instance.get('PrivateIpAddress', '—')
+    az    = instance.get('Placement', {}).get('AvailabilityZone', region)
+    lt    = instance.get('LaunchTime')
+    emoji = STATE_EMOJI.get(state, '⚪')
+
+    uptime, session = '—', ''
+    if lt and state == 'running':
+        diff = datetime.now(timezone.utc) - lt
+        hrs  = diff.total_seconds() / 3600
+        uptime = f"{int(hrs)}h {int((diff.total_seconds()%3600)//60)}m"
+        hourly = INSTANCE_COSTS.get(itype)
+        if hourly:
+            session = f" | 💸 ${hourly*hrs:.4f}"
+
+    if compact:
+        return f"{emoji} **{name}** [{az}] {itype} · {state.upper()} · {pub} · ⏱️{uptime}{session}"
+
+    hourly = INSTANCE_COSTS.get(itype)
+    cost = f"~${hourly}/hr | ~${hourly*10:.2f}/day | ~${hourly*10*22:.2f}/mo" if hourly else "N/A"
+    return (f"{emoji} **{name}** — EC2 Status\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 `{iid}` · 💻 {itype} · 🌍 {az}\n"
+            f"📍 **State:** {state.upper()}\n"
+            f"🌐 Public: {pub} · 🔒 Private: {priv}\n"
+            f"⏱️ Uptime: {uptime}\n"
+            f"💰 {cost}{session}\n"
+            f"━━━━━━━━━━━━━━━━━━━━")
+
+def get_status(names):
+    reports, total = [], 0
+    for region, ids in group_by_region(names).items():
+        try:
+            resp = ec2_client(region).describe_instances(InstanceIds=ids)
+            for r in resp['Reservations']:
+                for inst in r['Instances']:
+                    reports.append((region, inst))
+                    total += 1
+        except Exception:
+            reports.append((region, None))
+    compact = total > 2   # fleet view stays under Discord's limit
+    out = "\n".join(
+        build_report(inst, region, compact) if inst else f"⚠️ {region}: query failed"
+        for region, inst in reports
+    )
+    if len(out) > DISCORD_MSG_LIMIT:
+        out = out[:DISCORD_MSG_LIMIT - 20] + "\n…(truncated)"
+    return out
+
+# ── Discord plumbing ───────────────────────────────────────────
+def respond(message):
+    return {'statusCode': 200,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({'type': 4, 'data': {'content': message}})}
+
+def lambda_handler(event, context):
+    # ── Path 1: EventBridge Scheduler invocation (direct payload) ──
+    if isinstance(event, dict) and event.get('source') == 'scheduler':
+        action = event.get('action')          # 'start' | 'stop' | 'reboot'
+        names  = event.get('names', [])
+        names  = list(INSTANCE_MAP) if names == ['all'] else \
+                 [n for n in names if n in INSTANCE_MAP]
+        if action in ('start', 'stop', 'reboot') and names:
+            result = do_action(action, names)
+            print(f"[scheduler] {result}")     # CloudWatch audit trail
+            return {'statusCode': 200, 'body': result}
+        return {'statusCode': 400, 'body': 'Bad scheduler payload'}
+
+    # ── Path 2: Discord interaction ──
+    if not verify_signature(event):
+        return {'statusCode': 401, 'body': json.dumps('Invalid signature')}
+
+    body = json.loads(event['body'])
+
+    # Discord PING
+    if body.get('type') == 1:
+        return {'statusCode': 200, 'body': json.dumps({'type': 1})}
+
+    # Slash command
+    if body.get('type') == 2:
+        user_id = body.get('member', {}).get('user', {}).get('id') \
+                  or body.get('user', {}).get('id', '')
+        command = body['data']['name']
+        options = body['data'].get('options', [])
+        raw = next((o.get('value') for o in options if o.get('name') == 'name'), None)
+
+        if user_id not in ALLOWED_USER_IDS:
+            return respond("❌ You are **not authorized**!")
+
+        names, err = resolve_names(raw)
+        if err:
+            return respond(err)
+
+        try:
+            if command == 'start-ec2':
+                return respond(do_action('start', names))
+            if command == 'stop-ec2':
+                return respond(do_action('stop', names))
+            if command == 'reboot-ec2':
+                return respond(do_action('reboot', names))
+            if command == 'status-ec2':
+                return respond(get_status(names))
+        except Exception as e:
+            return respond(f"⚠️ AWS error: `{type(e).__name__}` — check CloudWatch")
+
+        return respond(f"❓ Unknown command `{command}`")
+
+    return {'statusCode': 400, 'body': 'Bad Request'}
+EOF
+
+zip -r function.zip .
+ls -lh function.zip
+```
+
+Download: CloudShell → **Actions → Download File** → `discord-bot/function.zip`
+
+### Upload to Lambda
+
+Lambda → your function → **Code → Upload from → .zip file** → upload → **Save**
+
+### Environment Variables
+
+**Configuration → Environment Variables → Edit:**
+
+| Key | Value | Example |
+| --- | --- | --- |
+| `INSTANCE_MAP` | JSON map `name → {id, region}` (**single line**) | `{"gameserver":{"id":"i-0aaa...","region":"ap-south-1"},"devbox":{"id":"i-0bbb...","region":"us-east-1"}}` |
+| `DISCORD_PUBLIC_KEY` | From Discord Developer Portal | `a1b2c3...` |
+| `ALLOWED_USER_IDS` | Comma-separated Discord User IDs | `123456789,987654321` |
+
+> 🗑️ **Note:** the old single-instance version's `EC2_REGION` and `INSTANCE_ID` variables are **gone** — region now lives per-instance inside `INSTANCE_MAP`.
+
+> ⚠️ Validate your `INSTANCE_MAP` JSON (e.g. at jsonlint.com) before pasting. Common killers: trailing comma, single quotes, smart quotes from copy-paste. Bad JSON = **every** invocation fails at import time.
+
+### Lambda General Settings
+
+**Configuration → General Configuration:** Timeout **10 seconds**, Memory **128 MB**.
+
+> ⚠️ **Discord's hard limit is 3 seconds** for the initial response. Start/Stop/Reboot return instantly (async on AWS side). Status queries run one `DescribeInstances` per region sequentially — with 2–4 regions you're comfortably under 3s. If you ever run 6+ regions or dozens of instances, switch to deferred responses (interaction type 5 + follow-up webhook).
+
+---
+
+## Part 4 — IAM (Least Privilege, Multi-Region)
+
+The region is **part of the ARN**, so each instance gets its own ARN with its own region.
+
+Lambda → **Configuration → Permissions → Role name → Add Permissions → Create Inline Policy → JSON:**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ControlOnlyMyInstances",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StartInstances",
+        "ec2:StopInstances",
+        "ec2:RebootInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:ap-south-1:YOUR_ACCOUNT_ID:instance/i-0aaa1111111111111",
+        "arn:aws:ec2:us-east-1:YOUR_ACCOUNT_ID:instance/i-0bbb2222222222222",
+        "arn:aws:ec2:eu-west-1:YOUR_ACCOUNT_ID:instance/i-0ccc3333333333333"
+      ]
+    },
+    {
+      "Sid": "DescribeNeedsWildcard",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances"],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+Name it `EC2DiscordControlMultiRegion` → **Create**.
+
+> 🔒 **Why two statements?** `DescribeInstances` does **not** support resource-level ARNs (AWS limitation), but Start/Stop/Reboot do. Even if the bot is compromised, it can only touch the exact instances **you listed** — in the exact regions you listed — not your whole account.
+
+> 📝 When you add a new instance or region later, add its ARN here too.
+
+---
+
+## Part 5 — API Gateway
+
+1. **API Gateway → Create API → HTTP API**
+2. **Add Integration → Lambda** → `discord-ec2-controller`
+3. **API name:** `discord-ec2-api`
+4. **Route:** `POST` `/discord`
+5. **Next → Next → Create**
+6. **Stages → $default** → copy **Invoke URL**
+
+Your endpoint:
+
+```
+https://xxxxxxxxxx.execute-api.ap-south-1.amazonaws.com/discord
+```
+
+---
+
+## Part 6 — EventBridge Scheduler (Lambda Target)
+
+Create schedules **in the same region as your Lambda** — they can control instances in any region because the region logic is in code.
+
+### Start Schedule — group `weekday-9to9`
+
+1. **AWS Console → EventBridge → Schedules → Create Schedule**
+2. Fill in:
+   - **Name:** `ec2-start-weekday-9to9`
+   - **Schedule type:** Recurring
+   - **Cron:** `0 9 ? * MON-FRI *`
+   - **Timezone:** set your local timezone directly (e.g. `Asia/Karachi`) — **cleaner than converting to UTC by hand**
+   - **Flexible time window:** Off
+3. **Target:** AWS Lambda → `discord-ec2-controller`
+4. **Payload (Input):**
+
+```json
+{
+  "source": "scheduler",
+  "action": "start",
+  "names": ["gameserver", "devbox"]
+}
+```
+
+5. **Permissions:** select **Create new role** — AWS auto-creates a role with `lambda:InvokeFunction` on your function
+6. **Create**
+
+### Stop Schedule — same group
+
+Repeat with:
+- **Name:** `ec2-stop-weekday-9to9`
+- **Cron:** `0 21 ? * MON-FRI *` (same timezone)
+- Same target, payload with `"action": "stop"`
+
+### More groups?
+
+Repeat the pair with a different name, cron, and `names` list. Instances in the `always-on` group simply get **no schedule**. You can also use `"names": ["all"]` for a whole-fleet schedule.
+
+### Cron Reference (with timezone set — no UTC math needed)
+
+| Schedule | Cron |
+| --- | --- |
+| Mon–Fri 9 AM local | `0 9 ? * MON-FRI *` |
+| Mon–Fri 9 PM local | `0 21 ? * MON-FRI *` |
+| Mon–Sat 9 AM local | `0 9 ? * MON-SAT *` |
+| Every day 9 AM local | `0 9 ? * * *` |
+
+> 💡 **Bleed-proof:** if a scheduled stop fires on an already-stopped instance, EC2 ignores it silently. Overlapping schedules are harmless. Scheduler actions are printed to CloudWatch Logs for a full audit trail.
+
+---
+
+## Part 7 — Register Slash Commands
+
+Create `register.py` on your PC:
+
+```python
+import requests
+
+BOT_TOKEN      = "YOUR_BOT_TOKEN"
+APPLICATION_ID = "YOUR_APPLICATION_ID"
+GUILD_ID       = "YOUR_SERVER_ID"
+
+# Must match INSTANCE_MAP keys in Lambda, plus "all"
+INSTANCES = ["gameserver", "devbox", "gitlab", "all"]
+
+name_option = {
+    "name": "name",
+    "description": "Which instance to target",
+    "type": 3,          # STRING
+    "required": True,
+    "choices": [{"name": i, "value": i} for i in INSTANCES],
+}
+
+commands = [
+    {"name": "start-ec2",  "description": "Start an EC2 instance",           "options": [name_option]},
+    {"name": "stop-ec2",   "description": "Stop an EC2 instance",            "options": [name_option]},
+    {"name": "reboot-ec2", "description": "Reboot an EC2 instance",          "options": [name_option]},
+    {"name": "status-ec2", "description": "Status: state, IP, uptime, cost", "options": [name_option]},
+]
+
+url = f"https://discord.com/api/v10/applications/{APPLICATION_ID}/guilds/{GUILD_ID}/commands"
+headers = {"Authorization": f"Bot {BOT_TOKEN}"}
+
+for cmd in commands:
+    r = requests.post(url, headers=headers, json=cmd)
+    print(f"{cmd['name']}: {r.status_code}", "" if r.ok else r.text)
+```
+
+Run:
+
+```bash
+pip install requests
+python register.py
+```
+
+Expected: four lines of `201` (or `200` when re-registering — both are success).
+
+> 💡 Discord allows max **25 choices** per option. More than 24 instances? Remove `choices` entirely — the option becomes free-text and Lambda-side validation still rejects bad names with a helpful list. Names stay region-agnostic, so `register.py` never needs region info.
+
+---
+
+## Part 8 — Connect Discord to API Gateway
+
+1. **Discord Developer Portal → your app → General Information**
+2. **Interactions Endpoint URL:**
+
+```
+https://xxxxxxxxxx.execute-api.ap-south-1.amazonaws.com/discord
+```
+
+3. **Save Changes** → Discord sends a PING; a ✅ means signature verification works.
+
+---
+
+## Commands Reference
+
+| Command | Example | What happens |
+| --- | --- | --- |
+| `/start-ec2` | `name:gameserver` | Starts that instance (in its own region) |
+| `/stop-ec2` | `name:all` | Stops **every** mapped instance across **all** regions |
+| `/reboot-ec2` | `name:gitlab` | Reboots that instance |
+| `/status-ec2` | `name:all` | Fleet summary — one compact line each, region shown |
+| `/status-ec2` | `name:devbox` | Full detailed report for one instance |
+
+### Example `/status-ec2 name:all` (multi-region fleet)
+
+```
+🟢 gameserver [ap-south-1a] t3.medium · RUNNING · 13.235.x.x · ⏱️3h 24m | 💸 $0.1414
+🔴 devbox [us-east-1b] t3.small · STOPPED · — · ⏱️—
+🟢 gitlab [eu-west-1a] t3.large · RUNNING · 54.72.x.x · ⏱️47h 2m | 💸 $3.9111
+```
+
+### Example `/stop-ec2 name:all` (multi-region action)
+
+```
+Stopping **gameserver**, **devbox**, **gitlab**
+✅ ap-south-1: 1 instance(s) — stop OK
+✅ us-east-1: 1 instance(s) — stop OK
+✅ eu-west-1: 1 instance(s) — stop OK
+```
+
+### Example `/status-ec2 name:gameserver`
+
+```
+🟢 gameserver — EC2 Status
+━━━━━━━━━━━━━━━━━━━━
+🆔 i-0aaa1111111111111 · 💻 t3.medium · 🌍 ap-south-1a
+📍 State: RUNNING
+🌐 Public: 13.235.x.x · 🔒 Private: 172.31.x.x
+⏱️ Uptime: 3h 24m
+💰 ~$0.0416/hr | ~$0.42/day | ~$9.15/mo | 💸 $0.1414
+━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## Adding / Removing Instances or Regions Later
+
+Four touch-points — a 5-minute job, **zero code redeploy**:
+
+1. **Lambda env var** — add/remove the entry in `INSTANCE_MAP` (with its region)
+2. **IAM policy** — add/remove the instance ARN (with its region) in `ControlOnlyMyInstances`
+3. **register.py** — update `INSTANCES` list → run `python register.py` again (re-registering overwrites, safe)
+4. **EventBridge payload** (optional) — add/remove the name from the relevant group's schedule payload
+
+A brand-new region needs **nothing extra** — no new schedules, no new Lambda, no code changes. The per-region client cache picks it up automatically. 🎯
+
+---
+
+## Cost Estimate
+
+| Service | Free Tier | Monthly Cost |
+| --- | --- | --- |
+| Lambda | 1M requests free | $0.00 |
+| API Gateway | 1M requests free | $0.00 |
+| EventBridge Scheduler | 14M invocations free | $0.00 |
+| EC2 | Depends on instances | Varies |
+
+Bot infrastructure cost stays **$0.00** regardless of instance or region count. Cross-region API calls from Lambda are free (control-plane calls, no data transfer).
+
+---
+
+## Troubleshooting
+
+### ❌ `invalid ELF header` on Lambda
+pynacl was built on macOS/Windows. Rebuild in **CloudShell** with `--platform manylinux2014_x86_64`.
+
+### ❌ `No module named '_cffi_backend'`
+Install cffi with the same `--platform` flags in CloudShell.
+
+### ❌ Lambda fails instantly on every request — `JSONDecodeError` in CloudWatch
+Your `INSTANCE_MAP` env var is invalid JSON. Common culprits: trailing comma, single quotes instead of double quotes, smart quotes from copy-paste, or the **old flat format** (`"name":"i-0abc"`) instead of the new nested format (`"name":{"id":"i-0abc","region":"..."}`).
+
+### ❌ Discord: `interactions endpoint url could not be verified`
+- URL must end with `/discord`
+- Or Lambda is crashing on import (check CloudWatch first)
+
+### ❌ `You are not authorized!`
+Wrong ID in `ALLOWED_USER_IDS`. Temporarily change the message to show `user_id`, copy the shown ID, fix env var, revert.
+
+### ❌ `Unknown instance` but the name is correct
+The name in `register.py`'s `INSTANCES` and the key in Lambda's `INSTANCE_MAP` must match exactly. Keep everything lowercase everywhere.
+
+### ❌ `UnauthorizedOperation` on start/stop — but only for ONE instance
+Classic multi-region bleed: you added the instance to `INSTANCE_MAP` but its IAM ARN has the **wrong region**, or is missing. The ARN's region segment must match the instance's actual region.
+
+### ❌ Scheduler runs but instances don't start
+1. CloudWatch Logs → look for the `[scheduler]` line and any `⚠️ region: FAILED` entries
+2. Check the schedule's payload has `"source": "scheduler"` exactly
+3. Check the Scheduler execution role has `lambda:InvokeFunction`
+
+### ❌ Schedule fires at the wrong time
+You set the cron in UTC but assumed local time (or vice versa). Fix: set the schedule's **Timezone** field explicitly (e.g. `Asia/Karachi`) instead of converting by hand — DST-proof and human-readable.
+
+### ❌ `/status-ec2 name:all` message looks cut off
+More than ~10 instances hit Discord's 2000-char limit; the code truncates gracefully. Query individual instances for full detail.
+
+### ❌ "The application did not respond" on `/status-ec2 name:all`
+Lambda exceeded Discord's 3-second window — usually cold start + many regions queried sequentially. Fixes in order: (1) fewer regions per fleet, (2) bump Lambda memory to 256 MB (faster CPU), (3) for 6+ regions move to deferred responses (interaction type 5 + follow-up webhook).
+
+### ❌ `KeyError: 'body'` when testing in Lambda console
+Your test event mimics neither Discord nor the scheduler. Use this Discord-style test event:
+
+```json
+{
+  "version": "2.0",
+  "headers": {
+    "x-signature-ed25519": "aabbccdd",
+    "x-signature-timestamp": "123456"
+  },
+  "body": "{\"type\": 1}",
+  "isBase64Encoded": false
+}
+```
+
+Expected: `{"statusCode": 401}` ✅ (signature correctly rejected)
+
+Or a scheduler-style test event:
+
+```json
+{"source": "scheduler", "action": "start", "names": ["gameserver"]}
+```
+
+---
+
+## Values Reference
+
+| Value | Where to Find |
+| --- | --- |
+| `Application ID` | Discord → App → General Information |
+| `Public Key` | Discord → App → General Information |
+| `Bot Token` | Discord → App → Bot → Reset Token |
+| `Discord User ID` | Discord → Right-click username → Copy User ID |
+| `Server ID` | Discord → Right-click server → Copy Server ID |
+| `Instance ID` | AWS → EC2 → Instances (check the **region selector** top-right!) |
+| `Instance Region` | AWS Console top-right corner while viewing that instance |
+| `Account ID` | AWS Console top-right → account dropdown |
+| `API Gateway URL` | API Gateway → your API → Stages → $default → Invoke URL |
+
+---
+
+## Tech Stack
+
+- **AWS EventBridge Scheduler** — cron schedules targeting Lambda with JSON payloads (region-agnostic)
+- **AWS Lambda** — single serverless controller, dual entry (Discord + Scheduler), Python 3.12
+- **AWS API Gateway** — HTTPS endpoint for Discord interactions
+- **Discord Interactions API** — slash commands with dropdown choices
+- **boto3 per-region client cache** — one bot, every region
+- **pynacl** — Ed25519 signature verification
+
+---
+
+*Built with ❤️ — one bot, entire fleet, every region, $0.00/month infra.*
