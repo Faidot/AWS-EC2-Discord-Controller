@@ -1,355 +1,43 @@
-# 🤖 EC2 Discord Controller + EventBridge Scheduler
+# Discord EC2 Controller — Final Setup README
 
-Control your AWS EC2 instance via Discord slash commands, with automatic start/stop scheduling using EventBridge. Perfect for dev servers that only need to run Mon–Fri, 9am–9pm.
-
----
-
-## 📋 Table of Contents
-
-- [Architecture](#architecture)
-- [Features](#features)
-- [Prerequisites](#prerequisites)
-- [Part 1 — EventBridge Scheduler](#part-1--eventbridge-scheduler)
-- [Part 2 — Discord Bot Setup](#part-2--discord-bot-setup)
-- [Part 3 — AWS Lambda Function](#part-3--aws-lambda-function)
-- [Part 4 — API Gateway](#part-4--api-gateway)
-- [Part 5 — Register Slash Commands](#part-5--register-slash-commands)
-- [Part 6 — Connect Discord to API Gateway](#part-6--connect-discord-to-api-gateway)
-- [Commands Reference](#commands-reference)
-- [Cost Estimate](#cost-estimate)
-- [Troubleshooting](#troubleshooting)
+Control AWS EC2 instances (start / stop / reboot / detailed status) from Discord slash commands. Supports a single instance, multiple instances in one account, and instances spread across multiple regions — all through **one bot and one Lambda function**.
 
 ---
 
 ## Architecture
 
 ```
-Discord Slash Command
+Discord Slash Command (/ec2 action:status instance:gitlab)
+        │  HTTPS POST (signed with Ed25519)
+        ▼
+API Gateway (HTTP API)  →  POST /discord
         │
         ▼
-  API Gateway (HTTPS)
+Lambda (Python 3.12)  →  reads INSTANCE_MAP env var  →  boto3 EC2 client per region
         │
         ▼
-  Lambda Function (Python 3.12)
-        │
-        ▼
-  EC2 Start / Stop / Reboot / Status
+EC2 StartInstances / StopInstances / RebootInstances / DescribeInstances
 
-EventBridge Scheduler
-  → 9:00 AM Mon–Fri  →  EC2 Start
-  → 9:00 PM Mon–Fri  →  EC2 Stop
+EventBridge Scheduler ── cron ── StartInstances / StopInstances (auto on/off)
 ```
 
----
-
-## Features
-
-| Feature | Details |
-|---------|---------|
-| ⏰ Auto Start | Every Mon–Fri at 9:00 AM |
-| 🛑 Auto Stop | Every Mon–Fri at 9:00 PM |
-| 📵 Weekend Off | Saturday & Sunday completely off |
-| 🚨 Emergency Control | Start/Stop/Reboot via Discord anytime |
-| 📊 Status Report | IP address, uptime, instance type, cost |
-| 💰 Cost Tracking | Current session cost + monthly estimate |
-| 🔒 Authorization | Only allowed Discord User IDs can control |
+One `INSTANCE_MAP` environment variable maps nicknames → `{instance_id, region}`. Add more instances or regions by adding entries — no new Lambda, no new bot, no new API.
 
 ---
 
 ## Prerequisites
 
-- AWS Account with EC2 instance running
-- Discord account + Server
-- Python 3.x installed on your PC
-- AWS CloudShell access
+- AWS account with permissions for IAM, Lambda, API Gateway, EventBridge
+- One or more EC2 instances already launched — note each **Instance ID** and its **Region** (not Availability Zone)
+- A Discord account and a server you manage
+- AWS CloudShell (built into the console — do all packaging here, not locally, to avoid OS/version mismatches)
 
 ---
 
-## Part 1 — EventBridge Scheduler
+## Step 1 — IAM Role for Lambda
 
-### Create Start Schedule (9 AM Mon–Fri)
-
-1. Go to **AWS Console → EventBridge → Schedules**
-2. Click **Create Schedule**
-3. Fill in:
-   - **Name:** `ec2-start-9am`
-   - **Schedule type:** Recurring schedule
-   - **Cron expression:** `0 9 ? * MON-FRI *`
-   - **Flexible time window:** Off
-4. **Target:** AWS API → EC2 → `StartInstances`
-5. Add Instance ID in JSON input:
-```json
-{
-  "InstanceIds": ["i-xxxxxxxxxxxxxxxxx"]
-}
-```
-6. Click **Create**
-
-### Create Stop Schedule (9 PM Mon–Fri)
-
-Repeat above with:
-- **Name:** `ec2-stop-9pm`
-- **Cron expression:** `0 21 ? * MON-FRI *`
-- **Target:** EC2 → `StopInstances`
-
-### Cron Reference
-
-| Schedule | Cron Expression |
-|----------|----------------|
-| Mon–Fri 9 AM | `0 9 ? * MON-FRI *` |
-| Mon–Fri 9 PM | `0 21 ? * MON-FRI *` |
-| Mon–Sat 9 AM | `0 9 ? * MON-SAT *` |
-| Every day 9 AM | `0 9 ? * * *` |
-
-> ⚠️ Times are in UTC. India (IST) = UTC+5:30, so 9 AM IST = 3:30 AM UTC
-
----
-
-## Part 2 — Discord Bot Setup
-
-### Create Discord Application
-
-1. Go to [discord.com/developers/applications](https://discord.com/developers/applications)
-2. Click **New Application** → Name: `EC2 Controller`
-3. Go to **General Information** → Copy and save:
-   - `Application ID`
-   - `Public Key`
-4. Go to **Bot** → Click **Reset Token** → Copy `Bot Token`
-5. Go to **Bot** → Enable:
-   - ✅ Server Members Intent
-   - ✅ Message Content Intent
-
-### Add Bot to Your Server
-
-1. Go to **OAuth2 → URL Generator**
-2. Check: `applications.commands` + `bot`
-3. Bot Permissions: `Send Messages`
-4. Copy URL → Open in browser → Select server → **Authorize**
-
-### Get Your Discord User ID
-
-1. Discord → **Settings → Advanced → Enable Developer Mode**
-2. Right-click your username → **Copy User ID**
-
-### Get Your Server ID
-
-1. Right-click your server name → **Copy Server ID**
-
----
-
-## Part 3 — AWS Lambda Function
-
-### Create Function
-
-1. Go to **AWS Lambda → Create Function**
-2. Settings:
-   - **Name:** `discord-ec2-controller`
-   - **Runtime:** Python 3.12
-   - **Architecture:** x86_64
-3. Click **Create Function**
-
-### Build Deployment Package (in AWS CloudShell)
-
-Open AWS CloudShell (`>_` icon in AWS Console top right) and run:
-
-```bash
-# Create project folder
-mkdir discord-bot && cd discord-bot
-
-# Install pynacl with correct Linux binary
-pip install pynacl \
-  --platform manylinux2014_x86_64 \
-  --implementation cp \
-  --python-version 312 \
-  --only-binary=:all: \
-  -t .
-
-# Install cffi
-pip install cffi \
-  --platform manylinux2014_x86_64 \
-  --implementation cp \
-  --python-version 312 \
-  --only-binary=:all: \
-  -t .
-
-# Create Lambda function file
-cat > lambda_function.py << 'EOF'
-import json
-import boto3
-import os
-import nacl.signing
-from nacl.exceptions import BadSignatureError
-from datetime import datetime, timezone
-
-EC2_REGION         = os.environ['EC2_REGION']
-INSTANCE_ID        = os.environ['INSTANCE_ID']
-DISCORD_PUBLIC_KEY = os.environ['DISCORD_PUBLIC_KEY']
-ALLOWED_USER_IDS   = os.environ['ALLOWED_USER_IDS'].split(',')
-
-ec2 = boto3.client('ec2', region_name=EC2_REGION)
-
-INSTANCE_COSTS = {
-    't2.micro':   0.0116, 't2.small':  0.023,  't2.medium': 0.0464,
-    't2.large':   0.0928, 't3.micro':  0.0104, 't3.small':  0.0208,
-    't3.medium':  0.0416, 't3.large':  0.0832, 't3.xlarge': 0.1664,
-    't3a.micro':  0.0094, 't3a.small': 0.0188, 't3a.medium':0.0376,
-    'm5.large':   0.096,  'm5.xlarge': 0.192,  'c5.large':  0.085,
-    'c5.xlarge':  0.17,   'r5.large':  0.126,  'r5.xlarge': 0.252,
-}
-
-def verify_signature(event):
-    try:
-        body      = event['body']
-        timestamp = event['headers'].get('x-signature-timestamp', '')
-        signature = event['headers'].get('x-signature-ed25519', '')
-        verify_key = nacl.signing.VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
-        verify_key.verify(f"{timestamp}{body}".encode(), bytes.fromhex(signature))
-        return True
-    except (BadSignatureError, ValueError, Exception):
-        return False
-
-def get_status():
-    resp     = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
-    instance = resp['Reservations'][0]['Instances'][0]
-
-    state         = instance['State']['Name']
-    instance_type = instance.get('InstanceType', 'Unknown')
-    public_ip     = instance.get('PublicIpAddress', 'No IP (instance stopped)')
-    private_ip    = instance.get('PrivateIpAddress', 'N/A')
-    launch_time   = instance.get('LaunchTime', None)
-    az            = instance.get('Placement', {}).get('AvailabilityZone', 'N/A')
-
-    name = 'N/A'
-    for tag in instance.get('Tags', []):
-        if tag['Key'] == 'Name':
-            name = tag['Value']
-
-    uptime_str = 'N/A'
-    if launch_time and state == 'running':
-        now    = datetime.now(timezone.utc)
-        diff   = now - launch_time
-        hours  = int(diff.total_seconds() // 3600)
-        mins   = int((diff.total_seconds() % 3600) // 60)
-        uptime_str = f"{hours}h {mins}m"
-
-    hourly = INSTANCE_COSTS.get(instance_type, None)
-    if hourly:
-        daily   = hourly * 10
-        monthly = daily * 22
-        if launch_time and state == 'running':
-            now          = datetime.now(timezone.utc)
-            diff         = now - launch_time
-            hours_run    = diff.total_seconds() / 3600
-            current_cost = hourly * hours_run
-            cost_str = (
-                f"~${hourly}/hr | ~${daily:.2f}/day | ~${monthly:.2f}/month\n"
-                f"💸 **Current Session:** ${current_cost:.4f} "
-                f"(running {hours_run:.1f} hrs)"
-            )
-        else:
-            cost_str = f"~${hourly}/hr | ~${daily:.2f}/day | ~${monthly:.2f}/month"
-    else:
-        cost_str = "N/A"
-
-    emoji = {'running':'🟢','stopped':'🔴','stopping':'🟡','pending':'🟡'}.get(state,'⚪')
-
-    return f"""
-{emoji} **EC2 Status Report**
-━━━━━━━━━━━━━━━━━━━━
-🏷️ **Name:**         {name}
-🆔 **Instance ID:**  {INSTANCE_ID}
-💻 **Type:**         {instance_type}
-📍 **State:**        {state.upper()}
-🌍 **Region/AZ:**    {az}
-━━━━━━━━━━━━━━━━━━━━
-🌐 **Public IP:**    {public_ip}
-🔒 **Private IP:**   {private_ip}
-⏱️ **Uptime:**       {uptime_str}
-━━━━━━━━━━━━━━━━━━━━
-💰 **Cost:**         {cost_str}
-━━━━━━━━━━━━━━━━━━━━
-"""
-
-def start_instance():
-    ec2.start_instances(InstanceIds=[INSTANCE_ID])
-    return "✅ EC2 is **starting**... wait ~30 seconds\nUse `/status-ec2` to check when it's ready"
-
-def stop_instance():
-    ec2.stop_instances(InstanceIds=[INSTANCE_ID])
-    return "🛑 EC2 is **stopping**...\nPublic IP will be released"
-
-def reboot_instance():
-    ec2.reboot_instances(InstanceIds=[INSTANCE_ID])
-    return "🔄 EC2 is **rebooting**... wait ~60 seconds\nUse `/status-ec2` to check when it's back online"
-
-def respond(message):
-    return {
-        'statusCode': 200,
-        'headers': {'Content-Type': 'application/json'},
-        'body': json.dumps({'type': 4, 'data': {'content': message}})
-    }
-
-def lambda_handler(event, context):
-    if not verify_signature(event):
-        return {'statusCode': 401, 'body': json.dumps('Invalid signature')}
-
-    body = json.loads(event['body'])
-
-    if body.get('type') == 1:
-        return {'statusCode': 200, 'body': json.dumps({'type': 1})}
-
-    if body.get('type') == 2:
-        user_id = body['member']['user']['id']
-        command = body['data']['name']
-
-        if user_id not in ALLOWED_USER_IDS:
-            return respond("❌ You are **not authorized**!")
-
-        if command == 'start-ec2':
-            return respond(start_instance())
-        elif command == 'stop-ec2':
-            return respond(stop_instance())
-        elif command == 'reboot-ec2':
-            return respond(reboot_instance())
-        elif command == 'status-ec2':
-            return respond(get_status())
-
-    return {'statusCode': 400, 'body': 'Bad Request'}
-EOF
-
-# Zip everything
-zip -r function.zip .
-ls -lh function.zip
-```
-
-Download the zip:
-1. CloudShell → **Actions → Download File**
-2. Type: `discord-bot/function.zip`
-3. Click **Download**
-
-### Upload to Lambda
-
-1. Lambda → your function → **Code** tab
-2. **Upload from → .zip file**
-3. Upload `function.zip` → **Save**
-
-### Environment Variables
-
-Go to **Configuration → Environment Variables → Edit → Add:**
-
-| Key | Value |
-|-----|-------|
-| `EC2_REGION` | e.g. `ap-south-1` |
-| `INSTANCE_ID` | e.g. `i-0abc1234567890` |
-| `DISCORD_PUBLIC_KEY` | From Discord Developer Portal |
-| `ALLOWED_USER_IDS` | Your Discord User ID (comma separated for multiple) |
-
-### IAM Permissions
-
-1. Lambda → **Configuration → Permissions → click Role name**
-2. **Add Permissions → Create Inline Policy**
-3. Paste JSON:
-
+1. **IAM → Roles → Create role → AWS service → Lambda**
+2. Attach an inline policy (JSON tab):
 ```json
 {
   "Version": "2012-10-17",
@@ -360,225 +48,383 @@ Go to **Configuration → Environment Variables → Edit → Add:**
         "ec2:StartInstances",
         "ec2:StopInstances",
         "ec2:RebootInstances",
-        "ec2:DescribeInstances"
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus"
       ],
       "Resource": "*"
     }
   ]
 }
 ```
-
-4. Name it `EC2DiscordControl` → **Create**
-
-### Lambda Settings
-
-Go to **Configuration → General Configuration → Edit:**
-- **Timeout:** 10 seconds
-- **Memory:** 128 MB (default is fine)
+3. Also attach the managed policy **`AWSLambdaBasicExecutionRole`** (for CloudWatch logging)
+4. Name it `discord-ec2-controller-role` → Create
 
 ---
 
-## Part 4 — API Gateway
+## Step 2 — Discord Application & Bot
 
-1. Go to **API Gateway → Create API → HTTP API**
-2. **Add Integration → Lambda** → select `discord-ec2-controller`
-3. **API name:** `discord-ec2-api`
-4. **Route:** Method `POST` → Path `/discord`
-5. Click **Next → Next → Create**
-6. Go to **Stages → $default** → copy **Invoke URL**
+1. **discord.com/developers/applications → New Application**
+2. **General Information** → copy and save: `Application ID`, `Public Key`
+3. **Bot** tab → Reset Token → copy and save the `Bot Token`
+4. **OAuth2 → URL Generator** → check `applications.commands` **and** `bot` scopes, permission `Send Messages` → open the generated URL → authorize it on your server
+5. Enable **Developer Mode** (Discord Settings → Advanced)
+6. Right-click your username → **Copy User ID** → save as your allowed user
+7. Right-click your server icon → **Copy Server ID** → save as `GUILD_ID`
 
-Your URL will look like:
-```
-https://xxxxxxxxxx.execute-api.ap-south-1.amazonaws.com
+---
+
+## Step 3 — Build the deployment package (in AWS CloudShell)
+
+Always build in CloudShell, never on your local Windows/Mac machine — compiled dependencies (`pynacl`, `cffi`) must match Lambda's Linux + Python version exactly.
+
+```bash
+mkdir -p ~/ec2-bot && cd ~/ec2-bot
+
+pip install pynacl cffi \
+  --platform manylinux2014_x86_64 \
+  --target . \
+  --only-binary=:all: \
+  --python-version 3.12 \
+  --implementation cp
 ```
 
-Your full endpoint:
+Create the function file with a heredoc (safer than pasting into any browser editor — avoids smart-quote/indentation corruption):
+
+```bash
+cat > lambda_function.py << 'PYEOF'
+import json
+import os
+import boto3
+from datetime import datetime, timezone
+from nacl.signing import VerifyKey
+from nacl.exceptions import BadSignatureError
+
+PUBLIC_KEY = os.environ["DISCORD_PUBLIC_KEY"]
+ALLOWED_USER_IDS = set(os.environ.get("ALLOWED_USER_IDS", "").split(","))
+INSTANCE_MAP = json.loads(os.environ["INSTANCE_MAP"])
+
+INSTANCE_PRICING = {
+    "t3.micro": 0.0104,
+    "t3.small": 0.0208,
+    "t3.medium": 0.0416,
+    "t3.large": 0.0832,
+    "t3.xlarge": 0.1664,
+    "t2.micro": 0.0116,
+    "t2.medium": 0.0464,
+    "m5.large": 0.096,
+    "m5.xlarge": 0.192,
+}
+
+
+def verify_signature(event):
+    signature = event["headers"].get("x-signature-ed25519")
+    timestamp = event["headers"].get("x-signature-timestamp")
+    body = event["body"]
+    verify_key = VerifyKey(bytes.fromhex(PUBLIC_KEY))
+    verify_key.verify(f"{timestamp}{body}".encode(), bytes.fromhex(signature))
+
+
+def ec2_client_for(region):
+    return boto3.client("ec2", region_name=region)
+
+
+def lambda_handler(event, context):
+    try:
+        verify_signature(event)
+    except (BadSignatureError, Exception):
+        return {"statusCode": 401, "body": "invalid request signature"}
+
+    body = json.loads(event["body"])
+
+    if body["type"] == 1:
+        return {"statusCode": 200, "body": json.dumps({"type": 1})}
+
+    user_id = body["member"]["user"]["id"]
+    if user_id not in ALLOWED_USER_IDS:
+        return respond("You are not authorized to run this command.")
+
+    options = {opt["name"]: opt["value"] for opt in body["data"].get("options", [])}
+    action = options.get("action")
+    nickname = options.get("instance")
+
+    target = INSTANCE_MAP.get(nickname)
+    if not target:
+        return respond(f"Unknown instance `{nickname}`. Known: {', '.join(INSTANCE_MAP)}")
+
+    client = ec2_client_for(target["region"])
+    iid = target["id"]
+
+    if action == "start":
+        client.start_instances(InstanceIds=[iid])
+        msg = f"Starting **{nickname}** ({target['region']})..."
+
+    elif action == "stop":
+        client.stop_instances(InstanceIds=[iid])
+        msg = f"Stopping **{nickname}** ({target['region']})..."
+
+    elif action == "reboot":
+        client.reboot_instances(InstanceIds=[iid])
+        msg = f"Rebooting **{nickname}** ({target['region']})..."
+
+    elif action == "status":
+        desc = client.describe_instances(InstanceIds=[iid])
+        inst = desc["Reservations"][0]["Instances"][0]
+
+        state = inst["State"]["Name"]
+        itype = inst["InstanceType"]
+        az = inst["Placement"]["AvailabilityZone"]
+        region = target["region"]
+        public_ip = inst.get("PublicIpAddress", "N/A")
+        private_ip = inst.get("PrivateIpAddress", "N/A")
+        name_tag = next(
+            (t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"),
+            nickname
+        )
+        hourly_rate = INSTANCE_PRICING.get(itype, 0.0)
+
+        if state == "running":
+            launch_time = inst["LaunchTime"]
+            now = datetime.now(timezone.utc)
+            hours = (now - launch_time).total_seconds() / 3600
+            h, m = int(hours), int((hours - int(hours)) * 60)
+            uptime_str = f"{h}h {m}m"
+            session_cost = hours * hourly_rate
+            cost_line = f"Current Session: ${session_cost:.4f} (running {hours:.1f} hrs)"
+        else:
+            uptime_str = "-"
+            cost_line = "Instance is stopped - no active session cost"
+
+        daily = hourly_rate * 24
+        monthly = hourly_rate * 24 * 30
+
+        msg = (
+            "```\n"
+            f"EC2 Status Report\n"
+            f"--------------------\n"
+            f"Name:         {name_tag}\n"
+            f"Instance ID:  {iid}\n"
+            f"Type:         {itype}\n"
+            f"State:        {state.upper()}\n"
+            f"Region/AZ:    {region} ({az})\n"
+            f"--------------------\n"
+            f"Public IP:    {public_ip}\n"
+            f"Private IP:   {private_ip}\n"
+            f"Uptime:       {uptime_str}\n"
+            f"--------------------\n"
+            f"Cost:         ~${hourly_rate:.4f}/hr | ~${daily:.2f}/day | ~${monthly:.2f}/month\n"
+            f"{cost_line}\n"
+            "```"
+        )
+
+    else:
+        msg = "Unknown action."
+
+    return respond(msg)
+
+
+def respond(text):
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({"type": 4, "data": {"content": text}})
+    }
+PYEOF
 ```
-https://xxxxxxxxxx.execute-api.ap-south-1.amazonaws.com/discord
+
+**Validate syntax before zipping — do this every time you edit the file:**
+```bash
+python3 -c "import ast; ast.parse(open('lambda_function.py').read()); print('SYNTAX OK')"
+```
+
+**Confirm the file sits at zip root, and dependencies match Python 3.12:**
+```bash
+ls | grep lambda_function.py
+ls | grep cffi_backend        # must show cpython-312, not 313
+```
+
+**Zip and confirm structure:**
+```bash
+rm -f function.zip
+zip -r function.zip .
+unzip -l function.zip | grep -E "lambda_function.py|cffi_backend"
+```
+`lambda_function.py` must appear with **no folder prefix** (e.g. not `ec2-bot/lambda_function.py`).
+
+---
+
+## Step 4 — Create the Lambda function
+
+1. **Lambda → Create function**: name `discord-ec2-controller`, Runtime **Python 3.12**, Architecture **x86_64**
+2. Under execution role, select **Use an existing role** → `discord-ec2-controller-role`
+3. **Code tab → Upload from → .zip file** → upload `function.zip`
+4. **Configuration → Environment variables**, add all three:
+
+| Key | Example value |
+|---|---|
+| `DISCORD_PUBLIC_KEY` | your Discord app's Public Key |
+| `ALLOWED_USER_IDS` | your Discord User ID (comma-separate for multiple people) |
+| `INSTANCE_MAP` | `{"gitlab":{"id":"i-01a2aefc2ba19130b","region":"ap-south-1"}}` |
+
+   - `INSTANCE_MAP` must be **valid single-line JSON**: double quotes only, no trailing commas
+   - The `region` value must be a **region** (`ap-south-1`), never an **Availability Zone** (`ap-south-1b` is wrong)
+   - Add more instances as more keys in the same object, e.g. `{"web":{"id":"i-...","region":"us-east-1"},"db":{"id":"i-...","region":"eu-west-1"}}`
+
+5. **Configuration → General configuration**: Timeout `10 sec`, Memory `128 MB`
+
+**Confirm what Lambda actually has stored (don't trust the console alone):**
+```bash
+aws lambda get-function-configuration --function-name discord-ec2-controller --query 'Environment'
+```
+
+**If you ever need to fix env vars via CLI directly:**
+```bash
+aws lambda update-function-configuration \
+  --function-name discord-ec2-controller \
+  --environment '{"Variables":{"DISCORD_PUBLIC_KEY":"...","ALLOWED_USER_IDS":"...","INSTANCE_MAP":"{\"gitlab\":{\"id\":\"i-...\",\"region\":\"ap-south-1\"}}"}}'
 ```
 
 ---
 
-## Part 5 — Register Slash Commands
+## Step 5 — API Gateway
 
-Create `register.py` on your PC:
+1. **API Gateway → Create API → HTTP API → Build**
+2. Add integration → Lambda → `discord-ec2-controller`
+3. Route: `POST /discord`
+4. Create → go to **Stages** → confirm `$default` stage exists with **Auto-deploy: true**
+5. Copy the Invoke URL, final endpoint is:
+   `https://<api-id>.execute-api.<region>.amazonaws.com/discord`
 
+**Confirm Lambda has permission to be invoked by API Gateway:**
+```bash
+aws lambda get-policy --function-name discord-ec2-controller
+```
+Should show a statement with `"Service":"apigateway.amazonaws.com"` scoped to your API's `/discord` route. If this errors `ResourceNotFoundException`, the permission is missing — re-add the Lambda integration in API Gateway.
+
+**Sanity-check the whole chain before touching Discord:**
+```bash
+curl -i -X POST https://<api-id>.execute-api.<region>.amazonaws.com/discord \
+  -H "Content-Type: application/json" \
+  -d '{"type":1}'
+```
+Expected: `HTTP/2 401` with body `invalid request signature`. That confirms API Gateway → Lambda routing works (the 401 is correct — curl can't fake Discord's real signature).
+
+---
+
+## Step 6 — Register the slash command
+
+On your local PC, `register.py`:
 ```python
 import requests
 
-BOT_TOKEN      = "YOUR_BOT_TOKEN"
-APPLICATION_ID = "YOUR_APPLICATION_ID"
-GUILD_ID       = "YOUR_SERVER_ID"
+APP_ID = "YOUR_APPLICATION_ID"
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+GUILD_ID = "YOUR_SERVER_ID"
 
-url = f"https://discord.com/api/v10/applications/{APPLICATION_ID}/guilds/{GUILD_ID}/commands"
+url = f"https://discord.com/api/v10/applications/{APP_ID}/guilds/{GUILD_ID}/commands"
 headers = {"Authorization": f"Bot {BOT_TOKEN}"}
 
-commands = [
-    {"name": "start-ec2",  "description": "Start the EC2 instance"},
-    {"name": "stop-ec2",   "description": "Stop the EC2 instance"},
-    {"name": "reboot-ec2", "description": "Reboot the EC2 instance"},
-    {"name": "status-ec2", "description": "Check EC2 status, IP and cost"},
-]
+command = {
+    "name": "ec2",
+    "description": "Control an EC2 instance",
+    "options": [
+        {
+            "type": 3, "name": "action", "description": "What to do", "required": True,
+            "choices": [
+                {"name": "start", "value": "start"},
+                {"name": "stop", "value": "stop"},
+                {"name": "reboot", "value": "reboot"},
+                {"name": "status", "value": "status"},
+            ],
+        },
+        {
+            "type": 3, "name": "instance", "description": "Which instance", "required": True,
+            "choices": [
+                {"name": "gitlab", "value": "gitlab"},
+                # add one entry per key in INSTANCE_MAP
+            ],
+        },
+    ],
+}
 
-for cmd in commands:
-    r = requests.post(url, headers=headers, json=cmd)
-    print(f"{cmd['name']}: {r.status_code}")
+r = requests.post(url, headers=headers, json=command)
+print(r.status_code, r.text)
 ```
-
-Run:
 ```bash
 pip install requests
 python register.py
 ```
-
-Expected output:
-```
-start-ec2:  201
-stop-ec2:   201
-reboot-ec2: 201
-status-ec2: 201
-```
+Expect `201`.
 
 ---
 
-## Part 6 — Connect Discord to API Gateway
+## Step 7 — Connect Discord to your endpoint
 
-1. Go to **Discord Developer Portal → your app**
-2. Go to **General Information**
-3. Paste in **Interactions Endpoint URL:**
-```
-https://xxxxxxxxxx.execute-api.ap-south-1.amazonaws.com/discord
-```
-4. Click **Save Changes** → should show ✅
+1. Discord Developer Portal → your app → **General Information**
+2. Paste `https://<api-id>.execute-api.<region>.amazonaws.com/discord` into **Interactions Endpoint URL**
+3. Save — should turn green
 
 ---
 
-## Commands Reference
+## Step 8 — Scheduling automatic start/stop (optional)
 
-| Command | Description |
-|---------|-------------|
-| `/start-ec2` | Start the EC2 instance |
-| `/stop-ec2` | Stop the EC2 instance |
-| `/reboot-ec2` | Reboot the EC2 instance |
-| `/status-ec2` | Full status: IP, uptime, cost |
+Per instance, per region, in **EventBridge → Schedules**:
+1. Create schedule, cron in **UTC**, e.g. `0 9 ? * MON-FRI *` for 9 AM start
+2. Target: **AWS API → EC2 → StartInstances** (or `StopInstances`), Region = the instance's own region
+3. Input: `{"InstanceIds": ["i-xxxxxxxxxxxx"]}`
 
-### Example `/status-ec2` Output
-
-```
-🟢 EC2 Status Report
-━━━━━━━━━━━━━━━━━━━━
-🏷️ Name:         MyServer
-🆔 Instance ID:  i-0abc1234567890
-💻 Type:         t3.medium
-📍 State:        RUNNING
-🌍 Region/AZ:    ap-south-1a
-━━━━━━━━━━━━━━━━━━━━
-🌐 Public IP:    13.235.xx.xx
-🔒 Private IP:   172.31.xx.xx
-⏱️ Uptime:       3h 24m
-━━━━━━━━━━━━━━━━━━━━
-💰 Cost: ~$0.04/hr | ~$0.42/day | ~$9.15/month
-💸 Current Session: $0.1386 (running 3.4 hrs)
-━━━━━━━━━━━━━━━━━━━━
-```
+Since EventBridge Scheduler is regional, create the schedule **in the same region as the target instance**.
 
 ---
 
-## Schedule Summary
+## Every bug hit during setup — and the fix
 
+| Symptom | Root cause | Fix |
+|---|---|---|
+| `403 Missing Access` when running `register.py` | Bot invited without `applications.commands` scope, or wrong Guild/App ID | Re-run OAuth2 URL Generator with both `applications.commands` + `bot` scopes, re-authorize on the correct server |
+| `No module named 'lambda_function'` | Zip was built with the folder nested inside (`ec2-bot/lambda_function.py`) instead of at zip root | `cd` into the folder containing the file, then `zip -r function.zip .` (the `.` matters) |
+| `No module named '_cffi_backend'` | Package installed for the wrong Python version (e.g. cpython-313 wheel on a Python 3.12 Lambda) | Reinstall with `--python-version 3.12 --implementation cp --platform manylinux2014_x86_64 --only-binary=:all:` |
+| `KeyError: 'INSTANCE_MAP'` | Environment variable named `INSTANCE_ID` instead of `INSTANCE_MAP`, or never saved | Verify with `aws lambda get-function-configuration --query 'Environment'`; fix name/value via console or `update-function-configuration` |
+| Region value like `ap-south-1b` rejected by boto3 | Availability Zone used instead of Region in `INSTANCE_MAP` | Use `ap-south-1`, not `ap-south-1b` |
+| `{"statusCode": 401, "body": "invalid request signature"}` on manual Lambda test | Expected behavior — Lambda's Test button can't produce a real Discord Ed25519 signature | Not a bug; verify with a real Discord PING or `curl` against the API Gateway URL instead |
+| Discord: "The application did not respond" | API Gateway → Lambda permission or route misconfigured | Check `aws lambda get-policy`, confirm route `POST /discord`, confirm `$default` stage exists with auto-deploy |
+| "The specified interactions endpoint url could not be verified" | `lambda_function.py` had a `SyntaxError` (broke Lambda's init phase entirely) | Validate with `python3 -c "import ast; ast.parse(open('lambda_function.py').read())"` before zipping/deploying, every time |
+| Emoji turned into `�` in the source file | Pasting through browser console editor / Windows terminal mangled UTF-8 encoding | Build the file in CloudShell with a `cat << 'PYEOF'` heredoc instead of pasting into the Lambda console editor |
+| Dict/code block landed mid-function, breaking `if/elif` chain | Manual copy-paste inserted a block in the wrong place | Always replace the **entire file** in one shot from a known-good, syntax-validated source rather than patching fragments |
+
+---
+
+## Quick end-to-end verification checklist
+
+```bash
+# 1. Syntax valid
+python3 -c "import ast; ast.parse(open('lambda_function.py').read()); print('SYNTAX OK')"
+
+# 2. Zip structured correctly
+unzip -l function.zip | grep -E "lambda_function.py|cffi_backend"
+
+# 3. Env vars present and correct
+aws lambda get-function-configuration --function-name discord-ec2-controller --query 'Environment'
+
+# 4. Lambda has no crash on load
+aws lambda invoke --function-name discord-ec2-controller --payload '{}' /tmp/out.json --cli-binary-format raw-in-base64-out && cat /tmp/out.json
+
+# 5. API Gateway can invoke Lambda
+aws lambda get-policy --function-name discord-ec2-controller
+
+# 6. Full chain reachable
+curl -i -X POST https://<api-id>.execute-api.<region>.amazonaws.com/discord -H "Content-Type: application/json" -d '{"type":1}'
+
+# 7. Live logs while testing from Discord
+aws logs tail /aws/lambda/discord-ec2-controller --since 5m
 ```
-Monday    → Auto ON 9:00 AM ✅  Auto OFF 9:00 PM ✅
-Tuesday   → Auto ON 9:00 AM ✅  Auto OFF 9:00 PM ✅
-Wednesday → Auto ON 9:00 AM ✅  Auto OFF 9:00 PM ✅
-Thursday  → Auto ON 9:00 AM ✅  Auto OFF 9:00 PM ✅
-Friday    → Auto ON 9:00 AM ✅  Auto OFF 9:00 PM ✅
-Saturday  → ❌ OFF all day
-Sunday    → ❌ OFF all day
 
-Emergency anytime → Discord commands 🚨
-```
+If all seven pass, `/ec2 action:status instance:<name>` in Discord will return the full status report.
 
 ---
 
-## Cost Estimate
+## Scaling notes
 
-| Service | Free Tier | Monthly Cost |
-|---------|-----------|-------------|
-| Lambda | 1M requests free | $0.00 |
-| API Gateway | 1M requests free | $0.00 |
-| EventBridge | 14M invocations free | $0.00 |
-| EC2 | Depends on instance type | Varies |
-
-> With 100 Discord commands/month you use 0.01% of the free tier.
-
----
-
-## Troubleshooting
-
-### ❌ `invalid ELF header` on Lambda
-**Cause:** pynacl built on macOS, not Linux.  
-**Fix:** Rebuild using AWS CloudShell with `--platform manylinux2014_x86_64` flag.
-
-### ❌ `No module named '_cffi_backend'`
-**Cause:** cffi C extension missing.  
-**Fix:** Install cffi with the same `--platform` flags in CloudShell.
-
-### ❌ Discord: `interactions endpoint url could not be verified`
-**Cause 1:** URL missing `/discord` at the end.  
-**Fix:** Make sure URL ends with `/discord`
-
-**Cause 2:** Lambda import error causing 500 response.  
-**Fix:** Check CloudWatch logs → fix the import error first.
-
-### ❌ `You are not authorized!` in Discord
-**Cause:** Discord User ID in `ALLOWED_USER_IDS` env var is wrong.  
-**Fix:** Temporarily update the error message to show the actual user ID:
-```python
-return respond(f"❌ Not authorized! Your ID: `{user_id}`")
-```
-Copy the ID shown → paste into `ALLOWED_USER_IDS` → revert code.
-
-### ❌ `KeyError: 'body'`
-**Cause:** Test event format is wrong.  
-**Fix:** Use this test event format:
-```json
-{
-  "version": "2.0",
-  "headers": {
-    "x-signature-ed25519": "aabbccdd",
-    "x-signature-timestamp": "123456"
-  },
-  "body": "{\"type\": 1}",
-  "isBase64Encoded": false
-}
-```
-Expected result: `{"statusCode": 401}` ✅
-
----
-
-## Values Reference
-
-| Value | Where to Find |
-|-------|--------------|
-| `Application ID` | Discord → App → General Information |
-| `Public Key` | Discord → App → General Information |
-| `Bot Token` | Discord → App → Bot → Reset Token |
-| `Discord User ID` | Discord → Right-click username → Copy User ID |
-| `Server ID` | Discord → Right-click server → Copy Server ID |
-| `Instance ID` | AWS → EC2 → Instances → your instance |
-| `EC2 Region` | AWS → top right corner |
-| `API Gateway URL` | API Gateway → your API → Stages → $default → Invoke URL |
-
----
-
-## Tech Stack
-
-- **AWS EventBridge** — Scheduled cron jobs
-- **AWS Lambda** — Serverless function (Python 3.12)
-- **AWS API Gateway** — HTTP endpoint for Discord
-- **Discord API** — Slash commands & bot
-- **pynacl** — Ed25519 signature verification
-
----
-
-*Built with ❤️ — Total monthly cost for Discord commands: $0.00*
+- **Single instance:** one `INSTANCE_MAP` entry, one choice in `register.py`.
+- **Multiple instances, same account:** add more entries to `INSTANCE_MAP` and matching choices in `register.py`. Same Lambda, same API Gateway, same bot.
+- **Multi-region:** each `INSTANCE_MAP` entry carries its own `region`; the Lambda creates a fresh `boto3.client("ec2", region_name=...)` per request, so one Lambda (deployed in any single region) can control instances anywhere. Only EventBridge Scheduler needs a schedule created *in* each target region, since it is a regional service.
+- **Cost:** effectively $0/month for the bot infrastructure itself (Lambda + API Gateway free tier) — you only pay for the EC2 instances you actually run.
